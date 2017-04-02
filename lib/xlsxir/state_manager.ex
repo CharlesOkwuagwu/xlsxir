@@ -8,35 +8,32 @@ defmodule Xlsxir.TableId do
   Initiates a new `TableId` Agent process with a value of `0`.
   """
   def new do
-    Agent.start_link(fn -> 0 end, name: TableId)
+    Agent.start_link(fn -> %{} end)
   end
 
   @doc """
-  Assigns an ETS table id to the `TableId` Agent process.
+  Assigns an ETS table id to the Agent process.
   """
-  def assign_id(id) do
-    Agent.update(TableId, &(&1 + id))
+  def assign_id(pid, id, value) when is_pid(pid) do
+    Agent.update(pid, fn state -> Map.put(state, id, value) end)
   end
 
   @doc """
-  Returns current value of `TableId` Agent process
+  Returns current value of Agent process
   """
-  def get do
-    Agent.get(TableId, &(&1))
+  def get(pid) when is_pid(pid)do
+    Agent.get(pid, &(&1))
   end
 
   @doc """
-  Deletes `TableId` Agent process
+  Deletes Agent process
   """
-  def delete do
-    Agent.stop(TableId)
+  def delete(pid) when is_pid(pid) do
+    Agent.stop(pid)
   end
 
-  def alive? do
-    case Process.whereis(TableId) do
-      pid when pid != nil -> Process.alive?(pid)
-      _                   -> false
-    end
+  def alive?(pid) when is_pid(pid) do
+    Process.alive?(pid)
   end
 end
 
@@ -86,33 +83,34 @@ defmodule Xlsxir.Worksheet do
   @doc """
   Initializes new ETS process with `[:set, :protected, :named_table]` options.
   """
-  def new do
-    :ets.new(:worksheet, [:set, :protected, :named_table])
+  def new(pid) when is_pid(pid) do
+    id = "#{pid |> inspect}_worksheet"
+    table = :ets.new(id |> String.to_atom, [:set, :protected])
+    TableId.assign_id(pid, id, table)
   end
 
   @doc """
   Initializes new ETS process with `[:set, :protected]` options and assigns the associated table id to `Xlsxir.TableId`.
   """
 
-  def new_multi do
-    TableId.new
-
-    :ets.new(:multi_worksheet, [:set, :protected])
-    |> TableId.assign_id
-  end
+  #def new_multi(pid) do
+    #id = "#{pid |> inspect}_multi_worksheet"
+    #table = :ets.new(id |> String.to_atom, [:set, :protected])
+    #TableId.assign_id(pid, id, table)
+  #end
 
   @doc """
   Stores a row at a given index in the ETS process.
   """
-  def add_row(row, index, id \\ :worksheet) do
-    id |> :ets.insert({index, row})
+  def add_row(row, index, pid) when is_pid(pid) do
+    id_by_pid(pid) |> :ets.insert({index, row})
   end
 
   @doc """
   Returns a row at a given index of the ETS process.
   """
-  def get_at(row_num, id \\ :worksheet) do
-    row = :ets.lookup(id, row_num)
+  def get_at(row_num, pid) when is_pid(pid) do
+    row = :ets.lookup(id_by_pid(pid), row_num)
 
     if row == [] do
       row
@@ -127,15 +125,19 @@ defmodule Xlsxir.Worksheet do
   @doc """
   Deletes the ETS process from memory.
   """
-  def delete(id \\ :worksheet) do
-    if alive?(id), do: :ets.delete(id), else: false 
+  def delete(pid) when is_pid(pid) do
+    if alive?(pid), do: :ets.delete(id_by_pid(pid)), else: false
   end
 
   @doc """
   Validates whether the ETS process is active, returning true or false.
   """
-  def alive?(id \\ :worksheet) do
-    Enum.member?(:ets.all, id)
+  def alive?(pid) when is_pid(pid) do
+    Enum.member?(:ets.all, id_by_pid(pid))
+  end
+
+  def id_by_pid(pid) when is_pid(pid) do
+    "#{pid |> inspect}_worksheet" |> String.to_atom
   end
 end
 
@@ -145,25 +147,29 @@ defmodule Xlsxir.SharedString do
   and retreive data, and ultimately kill the process.
   """
 
+  alias Xlsxir.TableId
+
   @doc """
   Initializes new ETS process with `[:set, :protected, :named_table]` options.
   """
-  def new do
-    :ets.new(:sharedstrings, [:set, :protected, :named_table])
+  def new(pid) when is_pid(pid) do
+    id = id_by_pid(pid)
+    table = :ets.new(id, [:set, :protected, :named_table])
+    TableId.assign_id(pid, "sharedstring", table)
   end
 
   @doc """
   Stores a sharedstring at a given index in the ETS process.
   """
-  def add_shared_string(shared_string, index) do
-    :sharedstrings |> :ets.insert({index, shared_string})
+  def add_shared_string(pid, shared_string, index) when is_pid(pid) do
+    id_by_pid(pid) |> :ets.insert({index, shared_string})
   end
 
   @doc """
   Returns a sharedstring at a given index of the ETS process.
   """
-  def get_at(index) do
-    :ets.lookup(:sharedstrings, index)
+  def get_at(pid, index) when is_pid(pid) do
+    :ets.lookup(id_by_pid(pid), index)
     |> List.first
     |> Tuple.to_list
     |> Enum.at(1)
@@ -172,15 +178,19 @@ defmodule Xlsxir.SharedString do
   @doc """
   Deletes the ETS process from memory.
   """
-  def delete do
-    :ets.delete(:sharedstrings)
+  def delete(pid) when is_pid(pid) do
+    pid |> id_by_pid |> :ets.delete
   end
 
   @doc """
   Validates whether the ETS process is active, returning true or false.
   """
-  def alive? do
-    Enum.member?(:ets.all, :sharedstrings)
+  def alive?(pid) when is_pid(pid) do
+    Enum.member?(:ets.all, id_by_pid(pid))
+  end
+
+  def id_by_pid(pid) when is_pid(pid) do
+    "#{pid |> inspect}_sharedstrings" |> String.to_atom
   end
 end
 

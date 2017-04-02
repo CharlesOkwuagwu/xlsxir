@@ -16,6 +16,7 @@ defmodule Xlsxir.SaxParser do
 
   ## Parameters
 
+  - `ets_name` - name of the associated ets table
   - `path` - path of XML file to be parsed in `string` format
   - `type` - file type identifier (:worksheet, :style or :string) of XML file to be parsed
   - `max_rows` - the maximum number of rows in this worksheet that should be parsed
@@ -45,7 +46,7 @@ defmodule Xlsxir.SaxParser do
           iex> Xlsxir.Worksheet.delete
           true
   """
-  def parse(content, type, max_rows \\ nil) do
+  def parse(ets_name, content, type, max_rows \\ nil) do
     case type do
       :worksheet -> Worksheet.new
       :multi     -> Worksheet.new_multi

@@ -186,7 +186,7 @@ defmodule Xlsxir do
   end
 
   defp do_multi_extract(file_paths, index, timer) do
-      Enum.each(file_paths, fn {file, content} ->
+    Enum.each(file_paths, fn {file, content} ->
       case file do
         'xl/sharedStrings.xml' -> SaxParser.parse(content, :string)
         'xl/styles.xml'        -> SaxParser.parse(content, :style)
