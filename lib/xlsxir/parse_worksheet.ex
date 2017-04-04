@@ -1,6 +1,5 @@
 defmodule Xlsxir.ParseWorksheet do
-  alias Xlsxir.{Codepoint, ConvertDate, ConvertDateTime,
-                SharedString, Style, TableId, Worksheet, SaxError}
+  alias Xlsxir.{ConvertDate, ConvertDateTime, SaxError}
   import Xlsxir.ConvertDate, only: [convert_char_number: 1]
   require Logger
   @moduledoc """
@@ -22,22 +21,18 @@ defmodule Xlsxir.ParseWorksheet do
   ## Example
   Each entry in the list created consists of a list containing a cell reference string and the associated value (i.e. `[["A1", "string one"], ...]`).
   """
-  def sax_event_handler({:startElement,_,'row',_,_}, _state) do
-    Codepoint.new
+  def sax_event_handler({:startElement,_,'row',_,_}, _state, pid) do
+    GenServer.call(pid, :codepoint)
     %Xlsxir.ParseWorksheet{
-      max_rows: Agent.get(MaxRows, &(&1))
+      max_rows: GenServer.call(pid, :get_max_rows)
     }
   end
 
-  def sax_event_handler({:startElement,_,'c',_,xml_attr}, state) do
+  def sax_event_handler({:startElement,_,'c',_,xml_attr}, state, pid) do
     a = Enum.map(xml_attr, fn(attr) ->
           case attr do
             {:attribute,'r',_,_,ref}   -> {:r, ref  }
-            {:attribute,'s',_,_,style} -> {:s, if Style.alive? do
-                                                 Style.get_at(List.to_integer(style))
-                                               else
-                                                 nil
-                                               end}
+            {:attribute,'s',_,_,style} -> {:s, GenServer.call(pid, {:styles, List.to_integer(style)})}
             {:attribute,'t',_,_,type}  -> {:t, type }
             _                          -> raise "Unknown cell attribute"
           end
@@ -53,49 +48,42 @@ defmodule Xlsxir.ParseWorksheet do
     %{state | cell_ref: cell_ref, num_style: num_style, data_type: data_type}
   end
 
-  def sax_event_handler({:characters, value}, state) do
+  def sax_event_handler({:characters, value}, state, _) do
     if state == nil, do: nil, else: %{state | value: value}
   end
 
-  def sax_event_handler({:endElement,_,'c',_}, %Xlsxir.ParseWorksheet{row: row} = state) do
-    cell_value = format_cell_value([state.data_type, state.num_style, state.value])
-    new_cells  = compare_to_previous_cell(to_string(state.cell_ref), cell_value)
+  def sax_event_handler({:endElement,_,'c',_}, %Xlsxir.ParseWorksheet{row: row} = state, pid) do
+    cell_value = format_cell_value(pid, [state.data_type, state.num_style, state.value])
+    new_cells  = compare_to_previous_cell(pid, to_string(state.cell_ref), cell_value)
     %{state | row: Enum.into(row, new_cells), cell_ref: "", data_type: "", num_style: "", value: ""}
   end
 
-  def sax_event_handler({:endElement,_,'row',_}, state) do
-    Codepoint.delete
+  def sax_event_handler({:endElement,_,'row',_}, state, pid) do
+    GenServer.call(pid, :rm_codepoint)
 
     unless Enum.empty?(state.row) do
       [[row]] = ~r/\d+/ |> Regex.scan(state.row |> List.first |> List.first)
       row     = row |> String.to_integer
-      if TableId.alive? do
-        state.row
-        |> Enum.reverse
-        |> Worksheet.add_row(row, TableId.get)
-      else
-        state.row
-        |> Enum.reverse
-        |> Worksheet.add_row(row)
-      end
+      value = state.row |> Enum.reverse
+      GenServer.call(pid, {:worksheet, value, row})
       if !is_nil(state.max_rows) and row == state.max_rows, do: raise SaxError
     end
     state
   end
 
-  def sax_event_handler(:endDocument, _state) do
-    if SharedString.alive?, do: SharedString.delete
-    if Style.alive?, do: Style.delete
+  def sax_event_handler(:endDocument, _state, pid) do
+    GenServer.call(pid, :rm_shared_strings)
+    GenServer.call(pid, :rm_styles)
   end
 
-  def sax_event_handler(_, state), do: state
+  def sax_event_handler(_, state, _), do: state
 
-  defp format_cell_value(list) do
+  defp format_cell_value(pid, list) do
     case list do
       [          _,   _, nil] -> nil                                                                 # Cell with no value attribute
       [          _,   _,  ""] -> nil                                                                 # Empty cell with assigned attribute
       [        'e', nil,   e] -> List.to_string(e)                                                   # Type error
-      [        's',   _,   i] -> SharedString.get_at(List.to_integer(i))                             # Type string
+      [        's',   _,   i] -> GenServer.call(pid, {:shared_strings, List.to_integer(i)})           # Type string
       [        nil, nil,   n] -> convert_char_number(n)                                              # Type number
       [        'n', nil,   n] -> convert_char_number(n)
       [        nil, 'd',   d] -> convert_date_or_time(d)                                             # ISO 8601 type date
@@ -117,35 +105,37 @@ defmodule Xlsxir.ParseWorksheet do
     end
   end
 
-  defp compare_to_previous_cell(ref, value) do
+  defp compare_to_previous_cell(pid, ref, value) do
     [[<<codepoint::utf8>>]] = ~r/[A-Z](?=[0-9])/i |> Regex.scan(ref)
     [[row_num]]             = ~r/[0-9]+/          |> Regex.scan(ref)
     [[col_ltr]]             = ~r/[A-Z]+/i         |> Regex.scan(ref)
 
     prefix = col_ltr |> String.slice(0, String.length(col_ltr) - 1)
+    current_codepoint = GenServer.call(pid, :get_codepoint)
 
     cond do
-      Codepoint.get == 0 and codepoint == 65  -> Codepoint.hold(65)
-                                                 [[ref, value]]
-      Codepoint.get == 90 and codepoint == 65 -> Codepoint.hold(65)
-                                                 [[ref, value]]
-      codepoint - Codepoint.get == 1          -> Codepoint.hold(codepoint)
-                                                 [[ref, value]]
-      true                                    -> get_empty_cells(codepoint, row_num, prefix)
-                                                 |> Enum.into([[ref, value]])
+      current_codepoint == 0 and codepoint == 65  -> GenServer.call(pid, {:codepoint, 65})
+                                                      [[ref, value]]
+      current_codepoint == 90 and codepoint == 65 -> GenServer.call(pid, {:codepoint, 65})
+                                                      [[ref, value]]
+      codepoint - current_codepoint == 1          -> GenServer.call(pid, {:codepoint, codepoint})
+                                                      [[ref, value]]
+      true                                        -> get_empty_cells(pid, codepoint, row_num, prefix)
+                                                      |> Enum.into([[ref, value]])
     end
   end
 
-  defp get_empty_cells(codepoint, row_num, prefix) do
+  defp get_empty_cells(pid, codepoint, row_num, prefix) do
+    current_codepoint = GenServer.call(pid, :get_codepoint)
     range = cond do
-              Codepoint.get == 0        -> (codepoint - 1)..65
-              codepoint == 65           -> 90..(Codepoint.get + 1)
-              Codepoint.get == 90       -> (codepoint - 1)..65
-              Codepoint.get > codepoint -> [90..(Codepoint.get + 1), (codepoint - 1)..65]
-              true                      -> (codepoint - 1)..(Codepoint.get + 1)
-            end
+      current_codepoint == 0        -> (codepoint - 1)..65
+      codepoint == 65               -> 90..(current_codepoint + 1)
+      current_codepoint == 90       -> (codepoint - 1)..65
+      current_codepoint > codepoint -> [90..(current_codepoint + 1), (codepoint - 1)..65]
+      true                          -> (codepoint - 1)..(current_codepoint + 1)
+    end
 
-    Codepoint.hold(codepoint)
+    GenServer.call(pid, {:codepoint, codepoint})
     create_empty_cells(range, row_num, prefix)
   end
 
