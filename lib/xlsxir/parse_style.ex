@@ -1,6 +1,4 @@
 defmodule Xlsxir.ParseStyle do
-  alias Xlsxir.{Index, Style}
-
   @moduledoc """
   Holds the SAX event instructions for parsing style data via `Xlsxir.SaxParser.parse/2`
   """
@@ -9,12 +7,11 @@ defmodule Xlsxir.ParseStyle do
   @num  [0,1,2,3,4,9,10,11,12,13,37,38,39,40,44,48,49,59,60,61,62,67,68,69,70]
   @date [14,15,16,17,18,19,20,21,22,27,30,36,45,46,47,50,57]
 
-  defstruct custom_style: %{}, cellxfs: false
+  defstruct custom_style: %{}, cellxfs: false, index: 0, tid: nil, num_fmt_ids: []
 
   @doc """
   Sax event utilized by `Xlsxir.SaxParser.parse/2`. Takes a pattern and the current state of a struct and recursivly parses the
-  styles XML file, ultimately sending each parsed style type to the `Xlsxir.Style` module which contains an ETS process that was started by 
-  `Xlsxir.SaxParser.parse/2`. The style types generated are `nil` for numbers and `'d'` for dates. 
+  styles XML file, ultimately saving each parsed style type to the ETS process. The style types generated are `nil` for numbers and `'d'` for dates.
 
   ## Parameters
 
@@ -22,12 +19,11 @@ defmodule Xlsxir.ParseStyle do
   - state - the state of the `%Xlsxir.ParseStyle{}` struct which temporarily holds each `numFmtId` and its associated `formatCode` for custom format types
 
   ## Example
-  Recursively sends style types generated from parsing the `xl/sharedStrings.xml` file to `Style.add_style/1`. The data can ultimately
-  be retreived by the `get_at/1` function of the `Xlsxir.Style` module (i.e. `Xlsxir.Style.get_at(0)` would return `nil` or `'d'` depending on each style type generated).
+  Recursively sends style types generated from parsing the `xl/sharedStrings.xml` file to ETS process. The data can ultimately
+  be retreived from the ETS table (i.e. `:ets.lookup(tid, 0)` would return `nil` or `'d'` depending on each style type generated).
   """
-  def sax_event_handler(:startDocument, _state) do 
-    Index.new
-    %Xlsxir.ParseStyle{}
+  def sax_event_handler(:startDocument, _state) do
+    %__MODULE__{tid: GenServer.call(Xlsxir.StateManager, :new_table)}
   end
 
   def sax_event_handler({:startElement,_,'cellXfs',_,_}, state) do
@@ -38,25 +34,24 @@ defmodule Xlsxir.ParseStyle do
     %{state | cellxfs: false}
   end
 
-  def sax_event_handler({:startElement,_,'xf',_,xml_attr}, state) do
+  def sax_event_handler({:startElement,_,'xf',_,xml_attr}, %__MODULE__{num_fmt_ids: num_fmt_ids} = state) do
     if state.cellxfs do
-      [{_,_,_,_,id}] = Enum.filter(xml_attr, fn attr -> 
-                         case attr do 
+      [{_,_,_,_,id}] = Enum.filter(xml_attr, fn attr ->
+                         case attr do
                            {:attribute,'numFmtId',_,_,_} -> true
                            _                             -> false
-                         end  
+                         end
                        end)
-
-      Style.add_id(id)
+      %{state | num_fmt_ids: num_fmt_ids ++ [id]}
+    else
+      state
     end
-    
-    state
   end
 
-  def sax_event_handler({:startElement,_,'numFmt',_,xml_attr}, 
-    %Xlsxir.ParseStyle{custom_style: custom_style} = state) do
-    
-    temp = Enum.reduce(xml_attr, %{}, fn attr, acc -> 
+  def sax_event_handler({:startElement,_,'numFmt',_,xml_attr},
+    %__MODULE__{custom_style: custom_style} = state) do
+
+    temp = Enum.reduce(xml_attr, %{}, fn attr, acc ->
             case attr do
               {:attribute,'numFmtId',_,_,id}   -> Map.put(acc, :id, id)
               {:attribute,'formatCode',_,_,cd} -> Map.put(acc, :cd, cd)
@@ -67,29 +62,27 @@ defmodule Xlsxir.ParseStyle do
     %{state | custom_style: Map.put(custom_style, temp[:id], temp[:cd])}
   end
 
-  def sax_event_handler(:endDocument, %Xlsxir.ParseStyle{custom_style: custom_style}) do
-
+  def sax_event_handler(:endDocument, %__MODULE__{} = state) do
+    %__MODULE__{custom_style: custom_style, num_fmt_ids: num_fmt_ids, index: index, tid: tid} = state
     custom_type = custom_style_handler(custom_style)
 
-    Enum.each(Style.get_id, fn style_type -> 
+    inc = Enum.reduce(num_fmt_ids, 0, fn style_type, acc ->
       case List.to_integer(style_type) do
-        i when i in @num   -> Style.add_style(nil, Index.get)
-        i when i in @date  -> Style.add_style('d', Index.get)
-        _                  -> add_custom_style(style_type, custom_type)
+        i when i in @num   -> :ets.insert(tid, {index + acc, nil})
+        i when i in @date  -> :ets.insert(tid, {index + acc, 'd'})
+        _                  -> add_custom_style(tid, style_type, custom_type, index + acc)
       end
-
-      Index.increment_1
+      acc + 1
     end)
 
-    Style.delete_id
-    Index.delete
+    %{state | index: index + inc}
   end
 
   def sax_event_handler(_, state), do: state
 
   defp custom_style_handler(custom_style) do
     custom_style
-    |> Enum.reduce(%{}, fn {k, v}, acc -> 
+    |> Enum.reduce(%{}, fn {k, v}, acc ->
          cond do
            String.match?(to_string(v), ~r/\bred\b/i) -> Map.put_new(acc, k, nil)
            String.match?(to_string(v), ~r/[dhmsy]/i) -> Map.put_new(acc, k, 'd')
@@ -98,9 +91,9 @@ defmodule Xlsxir.ParseStyle do
       end)
   end
 
-  defp add_custom_style(style_type, custom_type) do
+  defp add_custom_style(tid, style_type, custom_type, index) do
     if Map.has_key?(custom_type, style_type) do
-      Style.add_style(custom_type[style_type], Index.get)
+      :ets.insert(tid, {index, custom_type[style_type]})
     else
       raise "Unsupported style type: #{style_type}. See doc page \"Number Styles\" for more info."
     end

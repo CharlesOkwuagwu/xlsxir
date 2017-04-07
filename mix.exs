@@ -13,16 +13,16 @@ defmodule Xlsxir.Mixfile do
      description: description(),
      package: package(),
      deps: deps(),
-     docs: [main: "overview", extras: ["CHANGELOG.md", "NUMBER_STYLES.md", "OVERVIEW.md"]] 
+     docs: [main: "overview", extras: ["CHANGELOG.md", "NUMBER_STYLES.md", "OVERVIEW.md"]]
     ]
   end
 
   def application do
-    [applications: [:logger]]
+    [applications: [:logger], mod: {Xlsxir, []}]
   end
 
   defp deps do
-    [ 
+    [
       { :ex_doc, github: "elixir-lang/ex_doc", only: :dev },
       { :earmark, github: "pragdave/earmark", override: true, only: :dev },
       { :erlsom, "~> 1.4" }
@@ -45,5 +45,5 @@ defmodule Xlsxir.Mixfile do
                }
     ]
   end
-  
+
 end

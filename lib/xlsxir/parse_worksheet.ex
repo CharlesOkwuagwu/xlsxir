@@ -1,18 +1,16 @@
 defmodule Xlsxir.ParseWorksheet do
-  alias Xlsxir.{Codepoint, ConvertDate, ConvertDateTime,
-                SharedString, Style, TableId, Worksheet, SaxError}
+  alias Xlsxir.{ConvertDate, ConvertDateTime, SaxError}
   import Xlsxir.ConvertDate, only: [convert_char_number: 1]
   require Logger
   @moduledoc """
   Holds the SAX event instructions for parsing worksheet data via `Xlsxir.SaxParser.parse/2`
   """
 
-  defstruct row: %{}, cell_ref: "", data_type: "", num_style: "", value: "", max_rows: nil
+  defstruct row: %{}, cell_ref: "", data_type: "", num_style: "", value: "", max_rows: nil, tid: nil
 
   @doc """
   Sax event utilized by `Xlsxir.SaxParser.parse/2`. Takes a pattern and the current state of a struct and recursivly parses the
-  worksheet XML file, ultimately sending a keyword list of cell references and their assocated values to the `Xlsxir.Worksheet` module
-  which contains an ETS process that was started by `Xlsxir.SaxParser.parse/2`.
+  worksheet XML file, ultimately saving a list of cell references and their assocated values to the ETS process.
 
   ## Parameters
 
@@ -22,22 +20,19 @@ defmodule Xlsxir.ParseWorksheet do
   ## Example
   Each entry in the list created consists of a list containing a cell reference string and the associated value (i.e. `[["A1", "string one"], ...]`).
   """
-  def sax_event_handler({:startElement,_,'row',_,_}, _state) do
-    Codepoint.new
-    %Xlsxir.ParseWorksheet{
-      max_rows: Agent.get(MaxRows, &(&1))
-    }
+  def sax_event_handler(:startDocument, _state, %Xlsxir{max_rows: max_rows}) do
+    %__MODULE__{tid: GenServer.call(Xlsxir.StateManager, :new_table), max_rows: max_rows}
   end
 
-  def sax_event_handler({:startElement,_,'c',_,xml_attr}, state) do
+  def sax_event_handler({:startElement,_,'row',_,_}, %__MODULE__{tid: tid, max_rows: max_rows}, _excel) do
+    %__MODULE__{tid: tid, max_rows: max_rows}
+  end
+
+  def sax_event_handler({:startElement,_,'c',_,xml_attr}, state, %Xlsxir{styles: styles_tid}) do
     a = Enum.map(xml_attr, fn(attr) ->
           case attr do
             {:attribute,'r',_,_,ref}   -> {:r, ref  }
-            {:attribute,'s',_,_,style} -> {:s, if Style.alive? do
-                                                 Style.get_at(List.to_integer(style))
-                                               else
-                                                 nil
-                                               end}
+            {:attribute,'s',_,_,style} -> {:s, find_styles(styles_tid, List.to_integer(style))}
             {:attribute,'t',_,_,type}  -> {:t, type }
             _                          -> raise "Unknown cell attribute"
           end
@@ -53,49 +48,34 @@ defmodule Xlsxir.ParseWorksheet do
     %{state | cell_ref: cell_ref, num_style: num_style, data_type: data_type}
   end
 
-  def sax_event_handler({:characters, value}, state) do
+  def sax_event_handler({:characters, value}, state, _) do
     if state == nil, do: nil, else: %{state | value: value}
   end
 
-  def sax_event_handler({:endElement,_,'c',_}, %Xlsxir.ParseWorksheet{row: row} = state) do
-    cell_value = format_cell_value([state.data_type, state.num_style, state.value])
-    new_cells  = compare_to_previous_cell(to_string(state.cell_ref), cell_value)
-    %{state | row: Enum.into(row, new_cells), cell_ref: "", data_type: "", num_style: "", value: ""}
+  def sax_event_handler({:endElement,_,'c',_}, %__MODULE__{row: row} = state, %Xlsxir{} = excel) do
+    cell_value = format_cell_value(excel, [state.data_type, state.num_style, state.value])
+    %{state | row: Enum.into(row, [[to_string(state.cell_ref), cell_value]]), cell_ref: "", data_type: "", num_style: "", value: ""}
   end
 
-  def sax_event_handler({:endElement,_,'row',_}, state) do
-    Codepoint.delete
-
+  def sax_event_handler({:endElement,_,'row',_}, %__MODULE__{tid: tid, max_rows: max_rows} = state, _excel) do
     unless Enum.empty?(state.row) do
       [[row]] = ~r/\d+/ |> Regex.scan(state.row |> List.first |> List.first)
       row     = row |> String.to_integer
-      if TableId.alive? do
-        state.row
-        |> Enum.reverse
-        |> Worksheet.add_row(row, TableId.get)
-      else
-        state.row
-        |> Enum.reverse
-        |> Worksheet.add_row(row)
-      end
-      if !is_nil(state.max_rows) and row == state.max_rows, do: raise SaxError
+      value = state.row |> Enum.reverse
+      :ets.insert(tid, {row, value})
+      if !is_nil(max_rows) and row == max_rows, do: raise SaxError, state: state
     end
     state
   end
 
-  def sax_event_handler(:endDocument, _state) do
-    if SharedString.alive?, do: SharedString.delete
-    if Style.alive?, do: Style.delete
-  end
+  def sax_event_handler(_, state, _), do: state
 
-  def sax_event_handler(_, state), do: state
-
-  defp format_cell_value(list) do
+  defp format_cell_value(%Xlsxir{shared_strings: strings_tid}, list) do
     case list do
       [          _,   _, nil] -> nil                                                                 # Cell with no value attribute
       [          _,   _,  ""] -> nil                                                                 # Empty cell with assigned attribute
       [        'e', nil,   e] -> List.to_string(e)                                                   # Type error
-      [        's',   _,   i] -> SharedString.get_at(List.to_integer(i))                             # Type string
+      [        's',   _,   i] -> find_string(strings_tid, List.to_integer(i))                        # Type string
       [        nil, nil,   n] -> convert_char_number(n)                                              # Type number
       [        'n', nil,   n] -> convert_char_number(n)
       [        nil, 'd',   d] -> convert_date_or_time(d)                                             # ISO 8601 type date
@@ -117,71 +97,16 @@ defmodule Xlsxir.ParseWorksheet do
     end
   end
 
-  defp compare_to_previous_cell(ref, value) do
-    [[<<codepoint::utf8>>]] = ~r/[A-Z](?=[0-9])/i |> Regex.scan(ref)
-    [[row_num]]             = ~r/[0-9]+/          |> Regex.scan(ref)
-    [[col_ltr]]             = ~r/[A-Z]+/i         |> Regex.scan(ref)
-
-    prefix = col_ltr |> String.slice(0, String.length(col_ltr) - 1)
-
-    cond do
-      Codepoint.get == 0 and codepoint == 65  -> Codepoint.hold(65)
-                                                 [[ref, value]]
-      Codepoint.get == 90 and codepoint == 65 -> Codepoint.hold(65)
-                                                 [[ref, value]]
-      codepoint - Codepoint.get == 1          -> Codepoint.hold(codepoint)
-                                                 [[ref, value]]
-      true                                    -> get_empty_cells(codepoint, row_num, prefix)
-                                                 |> Enum.into([[ref, value]])
-    end
+  defp find_styles(tid, index) do
+    :ets.lookup(tid, index)
+    |> List.first
+    |> elem(1)
   end
 
-  defp get_empty_cells(codepoint, row_num, prefix) do
-    range = cond do
-              Codepoint.get == 0        -> (codepoint - 1)..65
-              codepoint == 65           -> 90..(Codepoint.get + 1)
-              Codepoint.get == 90       -> (codepoint - 1)..65
-              Codepoint.get > codepoint -> [90..(Codepoint.get + 1), (codepoint - 1)..65]
-              true                      -> (codepoint - 1)..(Codepoint.get + 1)
-            end
-
-    Codepoint.hold(codepoint)
-    create_empty_cells(range, row_num, prefix)
-  end
-
-  defp create_empty_cells(range, row_num, prefix) when is_list(range) do
-    [third, second] = case String.split(prefix, "", trim: true) do
-                        [<<second::utf8>>]                  -> ["", second]
-                        [<<third::utf8>>, <<second::utf8>>] -> [third, second]
-                      end
-
-    [pre_z, post_z] = range
-
-    case String.length(prefix) do
-      1 -> case second do
-             65 -> tail = pre_z  |> Enum.map(fn col_ltr -> [              <<col_ltr>> <> row_num, nil] end)
-                   head = post_z |> Enum.map(fn col_ltr -> [<<second>> <> <<col_ltr>> <> row_num, nil] end)
-                   Enum.into(tail, head)
-
-              _ -> tail = pre_z  |> Enum.map(fn col_ltr -> [<<(second - 1)>> <> <<col_ltr>> <> row_num, nil] end)
-                   head = post_z |> Enum.map(fn col_ltr -> [      <<second>> <> <<col_ltr>> <> row_num, nil] end)
-                   Enum.into(tail, head)
-           end
-
-      2 -> case [third, second] do
-             [65, 65] -> tail = pre_z  |> Enum.map(fn col_ltr -> [                 <<90, col_ltr>> <> row_num, nil] end)
-                         head = post_z |> Enum.map(fn col_ltr -> [<<third, second>> <> <<col_ltr>> <> row_num, nil] end)
-                         Enum.into(tail, head)
-
-                    _ -> tail = pre_z  |> Enum.map(fn col_ltr -> [<<third, (second - 1)>> <> <<col_ltr>> <> row_num, nil] end)
-                         head = post_z |> Enum.map(fn col_ltr -> [      <<third, second>> <> <<col_ltr>> <> row_num, nil] end)
-                         Enum.into(tail, head)
-           end
-    end
-  end
-
-  defp create_empty_cells(range, row_num, prefix) do
-    Enum.map(range, fn col_ltr -> [prefix <> <<col_ltr>> <> row_num, nil] end)
+  defp find_string(tid, index) do
+    :ets.lookup(tid, index)
+    |> List.first
+    |> elem(1)
   end
 
 end
