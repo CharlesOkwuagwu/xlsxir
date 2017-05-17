@@ -249,6 +249,10 @@ defmodule Xlsxir do
           iex> Xlsxir.close(tid)
           :ok
 
+          iex> {:ok, tid} = Xlsxir.extract("./test/test_data/test.xlsx", 2)
+          iex> Xlsxir.get_list(tid) |> List.first |> Enum.count
+          16384
+
           iex> {:ok, tid} = Xlsxir.multi_extract("./test/test_data/test.xlsx", 0)
           iex> Xlsxir.get_list(tid)
           [["string one", "string two", 10, 20, {2016, 1, 1}]]
@@ -434,7 +438,7 @@ defmodule Xlsxir do
       line = Regex.run(~r/\d+$/, ref) |> List.first
       empty_cells = cond do
         is_nil(previous) && String.first(ref) != "A" -> fill_empty_cells("A#{line}", ref, line, [])
-        !is_nil(previous) && !is_next_col(ref, previous) -> fill_empty_cells(previous, ref, line, [])
+        !is_nil(previous) && !is_next_col(ref, previous, line) -> fill_empty_cells(previous, ref, line, [])
         true -> []
       end
       {values ++ empty_cells ++ [[ref, val]], ref}
@@ -442,17 +446,26 @@ defmodule Xlsxir do
     |> elem(0)
   end
 
-  defp is_next_col(current, previous) do
-    String.to_charlist(current) == next_col(previous)
+  defp column_from_index(index, column) when index > 0 do
+    modulo = rem(index - 1, 26)
+    column = [65 + modulo | column]
+    column_from_index(div(index - modulo, 26), column)
+  end
+
+  defp column_from_index(_, column), do: to_string(column)
+
+  defp is_next_col(current, previous, line) do
+    current == "#{next_col(previous)}#{line}"
   end
 
   defp next_col(ref) do
-    chars = Regex.run(~r/^[A-Z]+/, ref) |> List.first |> String.to_charlist
-    case List.last(chars) do
-      # The last letter is "Z"
-      90 -> (String.duplicate("A", Enum.count(chars)) |> String.to_charlist) ++ [65]
-      char -> Enum.take(chars, Enum.count(chars) - 1) ++ [char + 1]
-    end
+    [chars] = Regex.run(~r/^[A-Z]+/, ref)
+    chars = chars |> String.to_charlist
+    col_index = Enum.reduce(chars, 0, fn char, acc ->
+      acc = acc * 26
+      acc + char - 65 + 1
+    end)
+    column_from_index(col_index + 1, '')
   end
 
   defp fill_empty_cells(from, from, _line, cells), do: Enum.reverse(cells)
