@@ -447,10 +447,10 @@ defmodule Xlsxir do
     :ets.match(table_id, {:"$1", :"$2"})
     |> Enum.sort
     |> Enum.map(fn [_num, row] -> row
-                                  |> Enum.filter_map(fn [ref, _val] ->
-                                       Regex.scan(~r/[A-Z]+/i, ref) == [[col]] end,
-                                       fn [_ref, val] -> val
+                                  |> Enum.filter(fn [ref, _val] ->
+                                       Regex.scan(~r/[A-Z]+/i, ref) == [[col]]                               
                                      end)
+                                  |> Enum.map(fn [_ref, val] -> val end)
                                 end)
     |> List.flatten
   end
