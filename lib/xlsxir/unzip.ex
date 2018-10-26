@@ -26,7 +26,7 @@ defmodule Xlsxir.Unzip do
          {:error, "Invalid worksheet index."}
   """
   def validate_path_and_index(path, index) do
-    path = String.to_char_list(path)
+    path = String.to_charlist(path)
 
     case valid_extract_request?(path, index) do
       :ok              -> {:ok, path}
@@ -145,7 +145,7 @@ defmodule Xlsxir.Unzip do
   """
   def extract_xml_to_file(file_list, path) do
     path
-    |> to_char_list
+    |> to_charlist
     |> :zip.extract([{:file_list, file_list}, {:cwd, 'temp/'}])
     |> case do
         {:error, reason}  -> {:error, reason}
